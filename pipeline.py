@@ -2,16 +2,7 @@ import argparse
 import yfinance as yf
 import pandas as pd
 import os
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# -----------------------------
-# Config
-# -----------------------------
-MAX_WORKERS = 8
-BATCH_SIZE = 50
-RETRIES = 2
-
+from datetime import datetime
 
 # -----------------------------
 # Argument Parsing
@@ -20,13 +11,17 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Yahoo Finance Data Pipeline")
 
     parser.add_argument("--tickers_file", type=str, required=True,
-                        help="File with tickers (one per line)")
-    parser.add_argument("--start", type=str, required=True)
-    parser.add_argument("--end", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="data/")
-    parser.add_argument("--format", choices=["csv", "parquet"], default="parquet")
+                        help="File containing tickers (one per line)")
+    parser.add_argument("--output", type=str, default="data/data.parquet",
+                        help="Output file path")
+    parser.add_argument("--period", type=str, default="5d",
+                        help="Yahoo period (e.g. 1d, 5d, 1mo)")
+    parser.add_argument("--start", type=str, default=None,
+                        help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", type=str, default=None,
+                        help="End date (YYYY-MM-DD)")
 
-    # Filtering args
+    # Filtering
     parser.add_argument("--min_volume", type=int, default=None)
     parser.add_argument("--min_return", type=float, default=None)
 
@@ -37,41 +32,43 @@ def parse_args():
 # Load tickers
 # -----------------------------
 def load_tickers(path):
-    with open(path, "r") as f:
+    with open(path) as f:
         tickers = [line.strip() for line in f if line.strip()]
     return tickers
 
 
 # -----------------------------
-# Fetch data (with retry)
+# Fetch data
 # -----------------------------
-def fetch_one(ticker, start, end):
-    for attempt in range(RETRIES + 1):
-        try:
-            df = yf.download(ticker, start=start, end=end, progress=False)
+def fetch_data(tickers, period=None, start=None, end=None):
+    print(f"📥 Fetching data for {len(tickers)} tickers...")
 
-            if df.empty:
-                return None
+    df = yf.download(
+        tickers,
+        period=period if start is None else None,
+        start=start,
+        end=end,
+        group_by="ticker",
+        progress=False
+    )
 
-            df.reset_index(inplace=True)
-            df["Ticker"] = ticker
-            return df
+    return df
 
-        except Exception as e:
-            if attempt < RETRIES:
-                time.sleep(1)
-            else:
-                print(f"Failed {ticker}: {e}")
-                return None
+
+# -----------------------------
+# Transform data
+# -----------------------------
+def transform_data(df):
+    # Convert multi-index → flat format
+    df = df.stack(level=0).rename_axis(["Date", "Ticker"]).reset_index()
+    return df
 
 
 # -----------------------------
 # Feature Engineering
 # -----------------------------
 def compute_features(df):
-    df["Return"] = df["Adj Close"].pct_change()
-    df["MA_10"] = df["Adj Close"].rolling(10).mean()
-    df["Volatility"] = df["Return"].rolling(10).std()
+    df["Return"] = df.groupby("Ticker")["Close"].pct_change()
     return df
 
 
@@ -89,83 +86,40 @@ def filter_data(df, min_volume=None, min_return=None):
 
 
 # -----------------------------
-# Process batch (parallel)
+# Save / Update data
 # -----------------------------
-def process_batch(tickers, start, end, min_volume, min_return):
-    results = []
+def save_data(df, output_path):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(fetch_one, t, start, end): t for t in tickers
-        }
+    if os.path.exists(output_path):
+        old = pd.read_parquet(output_path)
+        df = pd.concat([old, df])
+        df = df.drop_duplicates(subset=["Date", "Ticker"], keep="last")
 
-        for future in as_completed(futures):
-            ticker = futures[future]
-            df = future.result()
-
-            if df is not None:
-                df = compute_features(df)
-                df = filter_data(df, min_volume, min_return)
-                results.append(df)
-
-    return results
+    df.to_parquet(output_path, index=False)
+    print(f"✅ Saved data → {output_path}")
 
 
 # -----------------------------
-# Save batch
-# -----------------------------
-def save_batch(dfs, output_dir, batch_id, fmt):
-    if not dfs:
-        return
-
-    combined = pd.concat(dfs, ignore_index=True)
-    os.makedirs(output_dir, exist_ok=True)
-
-    if fmt == "parquet":
-        path = os.path.join(output_dir, f"batch_{batch_id}.parquet")
-        combined.to_parquet(path, index=False)
-    else:
-        path = os.path.join(output_dir, f"batch_{batch_id}.csv")
-        combined.to_csv(path, index=False)
-
-    print(f"✅ Saved batch {batch_id} -> {path}")
-
-
-# -----------------------------
-# Main Pipeline
-# -----------------------------
-def run_pipeline(args):
-    tickers = load_tickers(args.tickers_file)
-    total = len(tickers)
-
-    print(f"🚀 Processing {total} tickers...")
-
-    for i in range(0, total, BATCH_SIZE):
-        batch = tickers[i:i + BATCH_SIZE]
-        batch_id = i // BATCH_SIZE
-
-        print(f"\n📦 Batch {batch_id} ({len(batch)} tickers)")
-
-        results = process_batch(
-            batch,
-            args.start,
-            args.end,
-            args.min_volume,
-            args.min_return
-        )
-
-        save_batch(results, args.output_dir, batch_id, args.format)
-
-        # avoid rate limiting
-        time.sleep(2)
-
-
-# -----------------------------
-# Entry point
+# Main
 # -----------------------------
 def main():
     args = parse_args()
-    run_pipeline(args)
+
+    tickers = load_tickers(args.tickers_file)
+
+    raw = fetch_data(
+        tickers,
+        period=args.period,
+        start=args.start,
+        end=args.end
+    )
+
+    df = transform_data(raw)
+    df = compute_features(df)
+    df = filter_data(df, args.min_volume, args.min_return)
+
+    save_data(df, args.output)
 
 
 if __name__ == "__main__":
