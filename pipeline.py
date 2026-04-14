@@ -1,126 +1,174 @@
-import argparse
-import yfinance as yf
+# Install dependencies
+!pip install yfinance pyarrow
+
 import pandas as pd
+import yfinance as yf
 import os
-from datetime import datetime
+import time
 
 # -----------------------------
-# Argument Parsing
+# STEP 1: Create tickers.txt (run once)
 # -----------------------------
-def parse_args():
-    parser = argparse.ArgumentParser(description="Yahoo Finance Data Pipeline")
+if not os.path.exists("tickers.txt"):
+    print("📥 Creating tickers.txt...")
 
-    parser.add_argument("--tickers_file", type=str, required=True,
-                        help="File containing tickers (one per line)")
-    parser.add_argument("--output", type=str, default="data/data.parquet",
-                        help="Output file path")
-    parser.add_argument("--period", type=str, default="5d",
-                        help="Yahoo period (e.g. 1d, 5d, 1mo)")
-    parser.add_argument("--start", type=str, default=None,
-                        help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end", type=str, default=None,
-                        help="End date (YYYY-MM-DD)")
+    url = "https://github.com/yszanwar/phase2_qrt_challenge/releases/download/price_data/all_prices_5000_tickers.parquet"
+    df = pd.read_parquet(url)
 
-    # Filtering
-    parser.add_argument("--min_volume", type=int, default=None)
-    parser.add_argument("--min_return", type=float, default=None)
+    tickers = df.columns.get_level_values("Ticker").unique().tolist()
 
-    return parser.parse_args()
+    def normalize(t):
+        return str(t).replace(".", "-").replace("/", "-")
 
+    tickers = [normalize(t) for t in tickers]
 
-# -----------------------------
-# Load tickers
-# -----------------------------
-def load_tickers(path):
-    with open(path) as f:
-        tickers = [line.strip() for line in f if line.strip()]
-    return tickers
+    with open("tickers.txt", "w") as f:
+        for t in tickers:
+            f.write(t + "\n")
+
+    print(f"✅ Created tickers.txt ({len(tickers)} tickers)")
 
 
 # -----------------------------
-# Fetch data
+# STEP 2: Load tickers
 # -----------------------------
-def fetch_data(tickers, period=None, start=None, end=None):
-    print(f"📥 Fetching data for {len(tickers)} tickers...")
+def load_tickers(file_path):
+    with open(file_path) as f:
+        return [line.strip() for line in f if line.strip()]
 
-    df = yf.download(
-        tickers,
-        period=period if start is None else None,
-        start=start,
-        end=end,
-        group_by="ticker",
-        progress=False
-    )
+tickers = load_tickers("tickers.txt")
+print(f"📊 Loaded {len(tickers)} tickers")
+
+# 👉 TEST FIRST (remove later)
+tickers = tickers[:200]
+
+
+# -----------------------------
+# STEP 3: Fetch OHLCV data
+# -----------------------------
+def fetch_data(tickers, batch_size=20):
+    all_data = []
+
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i+batch_size]
+        print(f"\n📡 Batch {i//batch_size + 1}")
+
+        try:
+            data = yf.download(
+                batch,
+                period="5d",
+                group_by="ticker",
+                progress=False,
+                auto_adjust=False,
+                threads=False
+            )
+
+            if data.empty:
+                continue
+
+            data = data.stack(level=0, future_stack=True).rename_axis(["Date", "Ticker"]).reset_index()
+
+            all_data.append(data)
+
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"❌ Error: {e}")
+
+    return pd.concat(all_data, ignore_index=True)
+
+
+data = fetch_data(tickers)
+
+print(f"\n📦 Data shape: {data.shape}")
+
+
+# -----------------------------
+# STEP 4: Compute return
+# -----------------------------
+data["return"] = data.groupby("Ticker")["Close"].pct_change(fill_method=None)
+
+
+# -----------------------------
+# STEP 5: Fetch metadata (sector + marketCap)
+# -----------------------------
+def fetch_metadata(tickers):
+
+    if os.path.exists("metadata.parquet"):
+        print("📂 Loading cached metadata...")
+        return pd.read_parquet("metadata.parquet")
+
+    print("📊 Fetching metadata...")
+
+    meta = []
+
+    for i, t in enumerate(tickers):
+        try:
+            info = yf.Ticker(t).info
+
+            meta.append({
+                "symbol": t,
+                "sector": info.get("sector"),
+                "marketCap": info.get("marketCap")
+            })
+
+            if i % 50 == 0:
+                print(f"Processed {i}")
+
+        except:
+            continue
+
+    meta_df = pd.DataFrame(meta)
+    meta_df.to_parquet("metadata.parquet", index=False)
+
+    return meta_df
+
+
+meta = fetch_metadata(tickers)
+
+
+# -----------------------------
+# STEP 6: FINAL TRANSFORM
+# -----------------------------
+def transform(data, meta):
+
+    df = data.rename(columns={
+        "Ticker": "symbol",
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Volume": "volume"
+    })
+
+    df = df.merge(meta, on="symbol", how="left")
+
+    df = df[[
+        "Date", "symbol",
+        "open", "high", "low", "close",
+        "volume", "return",
+        "sector", "marketCap"
+    ]]
+
+    df = df.sort_values(["symbol", "Date"]).reset_index(drop=True)
 
     return df
 
 
-# -----------------------------
-# Transform data
-# -----------------------------
-def transform_data(df):
-    # Convert multi-index → flat format
-    df = df.stack(level=0).rename_axis(["Date", "Ticker"]).reset_index()
-    return df
+final_data = transform(data, meta)
 
 
 # -----------------------------
-# Feature Engineering
+# STEP 7: Save
 # -----------------------------
-def compute_features(df):
-    df["Return"] = df.groupby("Ticker")["Close"].pct_change()
-    return df
+final_data.to_csv("final_dataset.csv", index=False)
 
-
-# -----------------------------
-# Filtering
-# -----------------------------
-def filter_data(df, min_volume=None, min_return=None):
-    if min_volume is not None:
-        df = df[df["Volume"] >= min_volume]
-
-    if min_return is not None:
-        df = df[df["Return"] >= min_return]
-
-    return df
+print("✅ Saved as final_dataset.csv")
 
 
 # -----------------------------
-# Save / Update data
+# STEP 8: Preview
 # -----------------------------
-def save_data(df, output_path):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    if os.path.exists(output_path):
-        old = pd.read_parquet(output_path)
-        df = pd.concat([old, df])
-        df = df.drop_duplicates(subset=["Date", "Ticker"], keep="last")
-
-    df.to_parquet(output_path, index=False)
-    print(f"✅ Saved data → {output_path}")
-
-
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    args = parse_args()
-
-    tickers = load_tickers(args.tickers_file)
-
-    raw = fetch_data(
-        tickers,
-        period=args.period,
-        start=args.start,
-        end=args.end
-    )
-
-    df = transform_data(raw)
-    df = compute_features(df)
-    df = filter_data(df, args.min_volume, args.min_return)
-
-    save_data(df, args.output)
-
-
-if __name__ == "__main__":
-    main()
+pd.set_option('display.max_columns', None)
+print("\n📊 Final sample:")
+print(final_data.head())
